@@ -1,0 +1,235 @@
+from concurrent.futures import ThreadPoolExecutor
+import Result
+from ErrorConstants import BV_NOT_FOUND_ERROR_MSG, GAIN_PLAYBACK_ERROR_MSG, INVALID_URL_ERROR_MSG, NETWORK_ERROR_MSG, FILE_WRITE_ERROR_MSG, VIDEO_INFO_ERROR_MSG
+from flask import Flask
+import requests
+import re
+#import json
+import os
+import subprocess
+from datetime import datetime
+from Constants import (
+    BILIBILI_VIDEO_INFO_API,
+    BILIBILI_PLAY_URL_API,
+    DEFAULT_HEADERS,
+    DOWNLOADS_DIR,
+    INITIALIZATION_SUCCESS_MSG,
+    TEMP_DIR,
+    FILES_DIR,
+    GIF_SIZE,
+    GIF_START,
+    GIF_LENGTH,
+    GIF_RATE
+)
+
+# 参数验证手段 bv号+url
+def is_valid_bvid(bvid):
+    pattern = r'^(BV|bv)[0-9A-Za-z]{10}$'
+    return re.match(pattern, bvid) is not None
+
+def is_valid_Bilibili_url(url):
+    pattern = r'^(https?|ftp)://www\.bilibili\.com/video/(BV[0-9A-Za-z]{10})$'
+    return re.match(pattern, url) is not None
+
+app = Flask(__name__)
+
+executor = ThreadPoolExecutor(max_workers=4)
+
+#单独抽取出ffmpeg的命令api
+def run_ffmpeg_command(cmd):
+    subprocess.run(cmd, shell=True, check=True)
+    pass
+
+# 从url里提取出bv号来
+@app.route('/get_bvid/<path:url>', methods=['GET'])
+def get_bvid_from_url(url):
+    if not is_valid_Bilibili_url(url):
+        return Result.error(INVALID_URL_ERROR_MSG)
+    bv_pattern = r'(BV[0-9A-Za-z]{10})'
+    bv_match = re.search(bv_pattern, url)
+    if bv_match:
+        return bv_match.group(1)
+    return Result.error(BV_NOT_FOUND_ERROR_MSG)
+
+
+# 拿到视频信息
+@app.route('/get_video_info/<bvid>', methods=['GET'])
+def get_video_info(bvid):
+    #模拟客户端行为
+    if not is_valid_bvid(bvid):
+        return Result.error(BV_NOT_FOUND_ERROR_MSG)
+    info_url = BILIBILI_VIDEO_INFO_API.format(bvid=bvid)
+    res = requests.get(info_url, headers=DEFAULT_HEADERS)
+    datas = res.json()
+    
+    if datas['code'] != 0:
+        return Result.error(VIDEO_INFO_ERROR_MSG)
+    data = datas['data']
+    return Result.success(data)
+
+# 拿到播放地址
+@app.route('/get_play_url/<bvid>/<cid>', methods=['GET'])
+def get_video_play_url(bvid,cid):
+    play_url = BILIBILI_PLAY_URL_API.format(bvid=bvid, cid=cid)
+    res = requests.get(play_url, headers=DEFAULT_HEADERS)
+    data = res.json()
+
+    if data['code'] != 0:
+        return Result.error(GAIN_PLAYBACK_ERROR_MSG)
+    video_url = data['data']['dash']['video'][0]['baseUrl']
+    audio_url = data['data']['dash']['audio'][0]['baseUrl']
+    urls = [video_url, audio_url]
+    return Result.success(urls)
+
+# 下载视频文件
+# TODO：file path放url有些敏感
+@app.route('/download/', methods=['POST'])
+def download_file():
+    data = requests.get_json()
+    url = data.get('url')
+    filepath = data.get('filepath')
+    headers = DEFAULT_HEADERS
+    try:
+        res = requests.get(url, headers=headers, stream=True, timeout=10)
+        res.raise_for_status()
+        total_size = int(res.headers.get('content-length', 0))
+
+        with open(filepath, 'wb') as f:
+            downloaded = 0
+            for data in res.iter_content(chunk_size=1024):
+                downloaded += len(data)
+                f.write(data)
+                if total_size > 0:
+                    progress = (downloaded / total_size) * 100
+                    # TODO: 考虑用websocket推送下载进度
+                    print(f"\r下载进度: {progress:.2f}%", end='')
+        return Result.success(filepath)
+    except requests.RequestException as e:
+        return Result.error(NETWORK_ERROR_MSG)
+    except OSError as e:
+        return Result.error(FILE_WRITE_ERROR_MSG)
+
+
+@app.route('/merge', methods=['POST'])
+def merge_video_audio():
+    data = requests.get_json()
+    video_path = data.get('video_path')
+    audio_path = data.get('audio_path')
+    output_path = os.path.splitext(os.path.basename(video_path))[0]
+    cmd = f'ffmpeg -i "{video_path}" -i "{audio_path}" -c copy "{FILES_DIR}/{output_path}_final.mp4"'
+    executor.submit(run_ffmpeg_command, cmd)
+    #print("合并")
+    final_path = f"{FILES_DIR}/{output_path}_final.mp4"
+    return Result.success(final_path)
+
+
+@app.route('/init', methods=['POST'])
+def init():
+    try:
+         if not os.path.exists(DOWNLOADS_DIR):
+            os.makedirs(DOWNLOADS_DIR)
+            os.makedirs(TEMP_DIR)
+            os.makedirs(FILES_DIR)    
+            return Result.success(INITIALIZATION_SUCCESS_MSG)
+
+    except OSError as e:
+        return Result.error(FILE_WRITE_ERROR_MSG)
+
+
+# 单纯的转化文件为mp3
+@app.route('/mp3_convert', methods=[ 'POST'])
+def convert_to_mp3(flag):
+    data = requests.get_json()
+    input_path = data.get('input_path')
+    output_path = os.path.splitext(os.path.basename(input_path))[0]
+    cmd = f'ffmpeg -i "{input_path}" -c copy "{FILES_DIR}/{output_path}.mp3"'
+    executor.submit(run_ffmpeg_command, cmd)
+    #print("MP3转换完成")
+    #flag用来判断是否删除源文件
+    if flag:
+        os.remove(input_path)
+    return Result.success(output_path)
+        
+# gif动画转换，可做表情包
+@app.route('/gif_convert', methods=['POST'])
+def gif_convert():
+    data = requests.get_json()
+    input_path = data.get('input_path')
+    size = GIF_SIZE
+    start = GIF_START
+    length = GIF_LENGTH
+    rate = GIF_RATE
+    filename, ext = os.path.splitext(input_path)
+    output_path = f"{filename}_{size}_{start}_{length}.gif"
+    cmd = f'ffmpeg -ss {start} -t {length} -i "{input_path}" -r {rate} -s {size} "{output_path}"'
+    executor.submit(run_ffmpeg_command, cmd)
+    #print("GIF转换成功")
+    return Result.success(output_path)
+
+
+@app.route('/mp4_convert', methods=['POST'])
+def to_mp4():
+    data = requests.get_json()
+    input_path = data.get('input_path')
+    filename, ext = os.path.splitext(input_path)
+    now = datetime.now().strftime("%H%M%S")
+    output_path = f"{filename}_{now}.mp4"
+    cmd = f'ffmpeg -i "{input_path}" -y "{output_path}"'
+    executor.submit(run_ffmpeg_command, cmd)
+    #print("MP4转换任务完成")
+    return Result.success(output_path)
+
+
+##对应平台所需画质
+@app.route('/bilibili_1080p_convert', methods=['POST'])
+def bilibili_1080p_convert():
+    data = requests.get_json()
+    input_path = data.get('input_path')
+    output_path = f"{FILES_DIR}/{os.path.splitext(os.path.basename(input_path))[0]}_1080p.mp4"  
+    cmd = (
+        f'ffmpeg -i "{input_path}" '
+        '-c:v libx264 '
+        '-crf 23 '
+        '-preset medium '
+        '-profile:v high '
+        '-level 4.1 '
+        '-maxrate 6000k '
+        '-bufsize 12000k '
+        '-pix_fmt yuv420p '
+        '-movflags +faststart '
+        '-c:a aac '
+        '-b:a 192k '
+        '-ar 48000 '
+        f'"{output_path}"'
+    )
+    executor.submit(run_ffmpeg_command, cmd)
+    return Result.success(output_path)
+
+@app.route('/douyin_vertical_convert', methods=['POST'])
+def douyin_vertical_convert():
+    data = requests.get_json()
+    input_path = data.get('input_path')
+    output_path = f"{FILES_DIR}/{os.path.splitext(os.path.basename(input_path))[0]}_vertical.mp4"
+    cmd = (
+        f'ffmpeg -i "{input_path}" '
+        '-c:v libx264 '
+        '-crf 22 '
+        '-preset fast '
+        '-vf "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2" '
+        '-aspect 9:16 '
+        '-maxrate 3000k '
+        '-bufsize 6000k '
+        '-r 30 '
+        '-g 60 '
+        '-c:a aac '
+        '-b:a 128k '
+        '-ar 44100 '
+        f'"{output_path}"'
+    )
+    executor.submit(run_ffmpeg_command, cmd)
+    #print("抖音设置完成")
+    return Result.success(output_path)
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
